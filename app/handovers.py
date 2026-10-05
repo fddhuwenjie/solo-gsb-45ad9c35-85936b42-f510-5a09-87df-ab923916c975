@@ -36,7 +36,7 @@ import sqlite3
 
 from fastapi import HTTPException
 
-from .inventory import load_round
+from .inventory import identity_evidence, load_round
 from .merge import aliases_of, resolve_canonical
 from .schemas import (
     AreaHandoverChainOut,
@@ -71,45 +71,6 @@ def _load_rounds(
     return source, target
 
 
-def _evidence_for_identities(
-    round_out, identities: list[str]
-) -> dict[str, tuple[str, ...]]:
-    """收集一轮固化结果中每个身份（规范 ID 及其当前别名）的证据状态。
-
-    盘点轮次固化时按**当时**的别名关系解析 ID，固化结果随后不改写（见
-    inventory.py）；归并后同一规范档案可能同时以多个身份出现在旧轮次中。
-    状态取自该轮固化的差异分组，互斥分类：
-
-    - ``located``   ：列入预期且未落入任一组（明确定位在预期区域）；
-    - ``missing``   ：列入预期但全程无有效事件；
-    - ``misplaced`` ：定位区域与预期区域不同（附带 expected/actual）；
-    - ``unknown_position``：最后窗口多区域信号差不足阈值；
-    - ``unexpected``：不在预期清单但被读到（意外出现）。
-
-    未在该轮出现（既无预期也无观测）的身份不在返回值中。
-    """
-    missing = {m.canonical_id: m for m in round_out.missing}
-    misplaced = {m.canonical_id: m for m in round_out.misplaced}
-    unknown = {u.canonical_id: u for u in round_out.unknown_position}
-    unexpected = {u.canonical_id: u for u in round_out.unexpected}
-    expected = {e.canonical_id: e for e in round_out.expectations}
-
-    findings: dict[str, tuple[str, ...]] = {}
-    for ident in identities:
-        if ident in missing:
-            findings[ident] = ("missing", missing[ident].expected_area)
-        elif ident in misplaced:
-            m = misplaced[ident]
-            findings[ident] = ("misplaced", m.expected_area, m.actual_area)
-        elif ident in unknown:
-            findings[ident] = ("unknown_position", unknown[ident].expected_area)
-        elif ident in unexpected:
-            findings[ident] = ("unexpected", unexpected[ident].actual_area)
-        elif ident in expected:
-            findings[ident] = ("located", expected[ident].expected_area)
-    return findings
-
-
 def _require_identities_located(
     conn: sqlite3.Connection,
     round_out,
@@ -127,7 +88,7 @@ def _require_identities_located(
     身份集合只有规范 ID 一个，核验口径与历史行为完全一致。
     """
     identities = sorted({canonical_id, *aliases_of(conn, canonical_id)})
-    findings = _evidence_for_identities(round_out, identities)
+    findings = identity_evidence(round_out, identities)
 
     if not findings:
         raise HTTPException(
@@ -137,7 +98,7 @@ def _require_identities_located(
                    "不得交接",
         )
 
-    bad = {ident: f for ident, f in findings.items() if f[0] != "located"}
+    bad = {ident: f for ident, f in findings.items() if f["status"] != "located"}
     if bad:
         raise HTTPException(
             status_code=409,
@@ -146,7 +107,7 @@ def _require_identities_located(
                    "跨归并证据须全部合格，不得择一放行",
         )
 
-    located_areas = {f[1] for f in findings.values()}
+    located_areas = {f["actual_area"] for f in findings.values()}
     if len(located_areas) > 1:
         raise HTTPException(
             status_code=409,

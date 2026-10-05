@@ -61,9 +61,11 @@
   记录理由；相同 `request_key` 重放原结果，快照不可变。
 - 支持**展厅开放批次合规核验**：提交 `request_key`、核验时间窗、盘点
   `round_id`、展品 ID 清单与诊断阈值，服务在**一个 SQLite 写事务**内解析
-  别名、读取该轮次固化结果、逐件重算截至窗口末的 `calendar=display` 剂量
-  与完整诊断事件并检查未结处置单；只有全部展品都定位到预期区域、窗口内无
-  gap / jump / stuck、开放剂量未越限且无未结处置单时，才固化包含各项证据
+  别名、读取该轮次固化结果，并**按当前别名关系核对该规范档案的全部身份**
+  在轮次中的固化证据（归并前旧身份在该轮的记录一并核对：出现的身份须全部
+  列入预期清单并明确定位于同一区域，缺失 / 错位 / 位置不明 / 意外出现 /
+  区域冲突均阻断）、逐件重算截至窗口末的 `calendar=display` 剂量
+  与完整诊断事件并检查未结处置单；只有全部通过时，才固化包含各项证据
   摘要的**合规凭证**；任一失败返回逐件原因且**不写入**；同一 `request_key`
   仅在规范化输入与当时摘要一致时重放，否则 **409**。
 - 提供**可验证的 SQLite 在线快照**：`sqlite3.Connection.backup` 热备生成
@@ -1069,7 +1071,12 @@ curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
 
 - 展品 ID 先经归并别名解析为规范档案（不存在 → 404；解析后同一规范档案
   出现多次 → 422）；
-- 读取 `round_id` 对应轮次的**固化**盘点结果（轮次尚未对账 → 404）；
+- 读取 `round_id` 对应轮次的**固化**盘点结果（轮次尚未对账 → 404），
+  并**按当前别名关系**核对该规范档案的全部身份（规范 ID + 全部归并别名）
+  在轮次中的固化证据：轮次固化时按当时的别名关系存储，归并后旧身份的
+  记录仍以上来源 ID 留存——出现的身份须全部列入预期清单并明确定位于
+  同一区域，缺失 / 错位 / 位置不明 / 意外出现 / 多身份区域冲突均阻断，
+  全部身份都未出现即轮次未涵盖；旧盘点轮次与已签凭证绝不改写；
 - 逐件读取展陈日历，按与 `GET /dose?calendar=display` 同口径重算**截至
   窗口末的开放剂量**；
 - 按与 `POST /readings/diagnose` 同口径在完整未作废权威时间线上形成诊断
@@ -1078,8 +1085,9 @@ curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
 
 ### 合规条件（四项全部满足才固化凭证）
 
-1. 每件展品都在盘点轮次中**定位到预期区域**（缺失 / 错位 / 位置不明 /
-   意外出现 / 轮次未涵盖均为不合规）；
+1. 每件展品按当前别名关系核对的全部身份都在盘点轮次中**列入预期清单并
+   明确定位于同一区域**（缺失 / 错位 / 位置不明 / 意外出现 / 区域冲突 /
+   轮次未涵盖均为不合规）；
 2. 窗口内无 `gap` / `jump` / `stuck` 诊断事件（`timestamp_conflict`
    只记入证据，不阻断合规）；
 3. 截至窗口末的 `calendar=display` 开放剂量**未越限**（展品未配置展陈
@@ -1120,7 +1128,11 @@ curl -s -X POST http://localhost:8000/compliance-checks \
       "requested_id": "EX-101", "canonical_id": "EX-101",
       "compliant": true, "reasons": [],
       "location": {"status": "located",
-                   "expected_area": "A区展柜", "actual_area": "A区展柜"},
+                   "expected_area": "A区展柜", "actual_area": "A区展柜",
+                   "identities": [
+                     {"identity": "EX-101", "status": "located",
+                      "expected_area": "A区展柜", "actual_area": "A区展柜"}
+                   ]},
       "dose": {"dose_limit_luxh": 150.0, "known_dose_luxh": 120.0,
                "remaining_luxh": 30.0, "exceeded": false,
                "first_exceeded_at": null, "unknown_seconds": 0.0,
@@ -1160,7 +1172,11 @@ curl -s -X POST http://localhost:8000/compliance-checks \
          "detail": "存在 1 张未结处置单: 7f3a…"}
       ],
       "location": {"status": "misplaced",
-                   "expected_area": "A区展柜", "actual_area": "C区库房"},
+                   "expected_area": "A区展柜", "actual_area": "C区库房",
+                   "identities": [
+                     {"identity": "EX-101", "status": "misplaced",
+                      "expected_area": "A区展柜", "actual_area": "C区库房"}
+                   ]},
       "dose": {"…": "…"}, "events": [],
       "open_ticket_ids": ["7f3a…"]
     }
@@ -1177,11 +1193,77 @@ curl -s -X POST http://localhost:8000/compliance-checks \
 | `inventory_misplaced` | 盘点错位：判定区域与预期区域不同 |
 | `inventory_unknown_position` | 位置不明：最后窗口多区域信号差不足阈值 |
 | `inventory_unexpected` | 不在轮次预期清单中但被读到（意外出现） |
-| `inventory_not_covered` | 轮次既无预期也无观测记录，无法确认位置 |
+| `inventory_not_covered` | 全部身份在轮次中既无预期也无观测记录，无法确认位置 |
+| `inventory_area_conflict` | 按当前别名关系核对的多个身份明确定位于不同区域 |
 | `calendar_missing` | 未配置展陈开放日历，无法核算开放剂量 |
 | `dose_exceeded` | 截至窗口末的开放剂量已越限 |
 | `diagnosis_events` | 窗口内存在 gap / jump / stuck 事件（证据 `events` 中给出明细） |
 | `open_tickets` | 存在未结（open）照度异常处置单（`open_ticket_ids` 给出明细） |
+
+定位类原因的 `detail` 会指明具体身份（如 `身份 DUP-101：盘点轮次中定位为
+缺失：…`），`location.identities` 逐一列出在该轮出现的全部身份的固化结论。
+
+### 27b. 归并后按当前别名关系核对盘点证据
+
+盘点轮次固化后发生档案归并时，轮次中的旧身份记录**不改写**；合规核验按
+**当前别名关系**把规范 ID 与全部别名作为一个整体核对：
+
+```bash
+# 1) 归并前：DUP-101 是独立档案，在轮次 R-0901 中预期并定位于 A区展柜
+curl -s -X POST http://localhost:8000/inventory-rounds/R-0901/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_at": "2026-10-01T08:00:00Z", "window_seconds": 60,
+    "rssi_delta_threshold": 5,
+    "expected": [{"exhibit_id": "DUP-101", "area": "A区展柜"}],
+    "events":  [{"exhibit_id": "DUP-101", "area": "A区展柜",
+                 "ts": "2026-10-01T08:00:05Z", "rssi": -50}]
+  }'
+
+# 2) DUP-101 归并入 EX-101（DUP-101 成为永久别名）
+curl -s -X POST http://localhost:8000/merges/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id": "DUP-101", "target_id": "EX-101"}'
+curl -s -X POST http://localhost:8000/merges/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token": "<上一步返回的 token>", "resolutions": []}'
+
+# 3) 用目标 ID（或旧别名 DUP-101）核验：按当前别名关系找到 DUP-101 在
+#    R-0901 中固化的定位证据，不会误报 inventory_not_covered
+curl -s -X POST http://localhost:8000/compliance-checks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "hall-open-2026-10-02-am",
+    "round_id": "R-0901",
+    "start": "2026-10-02T01:00:00Z", "end": "2026-10-02T09:00:00Z",
+    "exhibit_ids": ["EX-101"],
+    "max_rate_lux_per_second": 1.0,
+    "stuck_tolerance_lux": 2.0, "min_stuck_seconds": 1800
+  }'
+```
+
+```json
+{"status": "compliant",
+ "exhibits": [
+   {"requested_id": "EX-101", "canonical_id": "EX-101",
+    "location": {"status": "located",
+                 "expected_area": "A区展柜", "actual_area": "A区展柜",
+                 "identities": [
+                   {"identity": "DUP-101", "status": "located",
+                    "expected_area": "A区展柜", "actual_area": "A区展柜"}]},
+    "…": "其余证据同上"}
+ ],
+ "…": "…"}
+```
+
+核对规则（出现的身份须**全部**合格，不择一放行）：
+
+- 轮次中**出现的身份**（在预期清单或观测事件中出现）都须列入预期清单并
+  明确定位于**同一区域**；任一身份缺失 / 错位 / 位置不明 / 意外出现，
+  或多个身份分别定位于不同区域（`inventory_area_conflict`），都阻断凭证；
+- 全部身份都未在轮次中出现 → `inventory_not_covered`；
+- 反之，同轮目标定位正常而来源身份缺失（或错位、位置不明、意外出现）时
+  **不会**误签凭证；照度、日历、诊断与未结处置单仍按当前规范档案核算。
 
 ### 28. request_key 重放、409 与凭证查询
 
@@ -1190,8 +1272,9 @@ curl -s -X POST http://localhost:8000/compliance-checks \
 - 规范化口径：`start` / `end` 统一为 UTC `Z` 结尾；展品 ID 全部解析为
   **规范档案 ID** 并排序（清单顺序、归并别名写法、等价时区写法都不影响
   摘要）；诊断阈值按浮点稳定序列化参与哈希；
-- 证据摘要：规范化输入 + 轮次 `request_digest` + 逐件证据（盘点定位结论、
-  `calendar=display` 剂量、窗口内诊断事件、未结处置单 ID）的 SHA-256。
+- 证据摘要：规范化输入 + 轮次 `request_digest` + 逐件证据（按当前别名关系
+  核对的逐身份盘点定位结论、`calendar=display` 剂量、窗口内诊断事件、
+  未结处置单 ID）的 SHA-256。
 
 ```bash
 # 相同 request_key + 规范化输入相同 + 证据摘要未变 → 200，重放首次凭证
@@ -1895,12 +1978,12 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── arbitration.py # 多来源读数仲裁：来源优先级版本、逐时刻权威值选取、并列冲突、诊断输入展开
 │   ├── calendar.py  # 展陈开放日历：每周规则 + 日期例外展开、跨午夜、夏令时边界解析
 │   ├── merge.py     # 重复档案归并：预演、版本令牌、单事务提交、永久别名、归并前收据链校验、来源配置合并
-│   ├── inventory.py # RFID 盘点对账：固定窗口最高 RSSI 定位、信号差阈值判不明、四类差异、请求摘要绑定与并发固化
+│   ├── inventory.py # RFID 盘点对账：固定窗口最高 RSSI 定位、信号差阈值判不明、四类差异、请求摘要绑定与并发固化、固化结果的跨身份解释
 │   ├── evacuation.py # 应急撤离编排：时变最早到达搜索、[进入,离开) 半开容量计数、封闭等待/绕行、路径字典序决胜（纯只读）
 │   ├── receipts.py  # 照度上报存证：收据规范序列化、SHA-256 链哈希、整链校验
 │   ├── corrections.py # 上报批次更正：作废收据中实际插入的读数、request_key 幂等、前置变化整次 409
 │   ├── tickets.py   # 照度异常处置单：创建时单事务重算诊断/剂量/链尾并固化快照，结案重算核对（409 不写入）、resolved 举证
-│   ├── compliance.py # 展厅开放批次合规核验：单事务核验（盘点定位/开放剂量/诊断事件/未结处置单），全过才固化凭证，request_key 幂等
+│   ├── compliance.py # 展厅开放批次合规核验：单事务核验（按当前别名关系核对全部身份的盘点定位/开放剂量/诊断事件/未结处置单），全过才固化凭证，request_key 幂等
 │   ├── snapshots.py # SQLite 在线快照：backup 热备、临时文件 + SHA-256 清单 + 原子重命名、只读校验
 │   ├── db.py        # SQLite 连接与建表（exhibits / readings / ingest_receipts / exhibit_aliases / merge_previews / 日历四表 / inventory_rounds / reading_corrections / source_priority_versions / illumination_tickets / compliance_credentials）
 │   └── schemas.py   # Pydantic 请求/响应模型
@@ -1914,7 +1997,7 @@ uvicorn app.main:app --reload  # 本地起服务，默认 http://127.0.0.1:8000
 │   ├── test_inventory.py # RFID 盘点对账：窗口定位、四类差异、别名解析、摘要重放/409、并发固化、隔离性
 │   ├── test_evacuation.py # 应急撤离：容量竞争、半开封闭等待/绕行、路径字典序平局、别名重复 422、无出口 422、只读隔离
 │   ├── test_tickets.py   # 照度异常处置单：快照固化与 digest、request_key 重放/换目标 409、结案核对 409、resolved 举证、并发
-│   ├── test_compliance.py # 展厅开放批次合规核验：凭证固化、逐件失败原因、重放/换目标/证据变化 409、别名、并发
+│   ├── test_compliance.py # 展厅开放批次合规核验：凭证固化、逐件失败原因、重放/换目标/证据变化 409、别名、归并后跨身份盘点证据核对、并发
 │   └── test_snapshots.py # 在线快照：事务一致副本、409 并发、原子发布、下载、只读校验与防篡改
 ├── requirements.txt         # 运行时依赖（含 tzdata，保证容器内 IANA 时区数据库可用）
 ├── requirements-dev.txt     # 测试依赖

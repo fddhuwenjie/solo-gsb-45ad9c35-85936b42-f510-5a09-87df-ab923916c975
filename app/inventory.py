@@ -154,6 +154,60 @@ def locate_tags(
     return positions, used, before
 
 
+# ---------- 固化结果的跨身份解释 ----------
+
+def identity_evidence(
+    round_out: InventoryRoundOut, identities: list[str]
+) -> dict[str, dict]:
+    """在一轮**固化**盘点结果中逐个解释给定身份的证据状态。
+
+    盘点轮次固化时按**当时**的别名关系把展品 ID 解析为规范档案，固化结果
+    随后不改写；归并（含链式归并）后同一规范档案可能以多个身份（当前规范
+    ID + 历史来源别名）出现在旧轮次中。本函数把给定身份集合逐一放到该轮
+    固化结果中解释，返回 ``{身份: 定位结论}``；**未在该轮出现**（既无预期
+    也无观测）的身份不在返回值中。
+
+    定位结论为下列互斥状态之一（与轮次输出的四组差异一一对应）：
+
+    - ``located``：列入预期清单且明确定位于预期区域（唯一合格状态）；
+    - ``missing``：列入预期但全程无有效读头事件；
+    - ``misplaced``：判定区域与预期区域不同；
+    - ``unknown_position``：最后窗口多区域信号差不足阈值；
+    - ``unexpected``：不在预期清单中但被读到（意外出现）。
+    """
+    missing = {m.canonical_id: m for m in round_out.missing}
+    misplaced = {m.canonical_id: m for m in round_out.misplaced}
+    unknown = {u.canonical_id: u for u in round_out.unknown_position}
+    unexpected = {u.canonical_id: u for u in round_out.unexpected}
+    expected = {e.canonical_id: e for e in round_out.expectations}
+
+    findings: dict[str, dict] = {}
+    for ident in identities:
+        if ident in missing:
+            findings[ident] = {"status": "missing",
+                               "expected_area": missing[ident].expected_area,
+                               "actual_area": None}
+        elif ident in misplaced:
+            m = misplaced[ident]
+            findings[ident] = {"status": "misplaced",
+                               "expected_area": m.expected_area,
+                               "actual_area": m.actual_area}
+        elif ident in unknown:
+            findings[ident] = {"status": "unknown_position",
+                               "expected_area": unknown[ident].expected_area,
+                               "actual_area": None}
+        elif ident in unexpected:
+            findings[ident] = {"status": "unexpected",
+                               "expected_area": None,
+                               "actual_area": unexpected[ident].actual_area}
+        elif ident in expected:
+            area = expected[ident].expected_area
+            findings[ident] = {"status": "located",
+                               "expected_area": area,
+                               "actual_area": area}
+    return findings
+
+
 # ---------- 规范化请求摘要 ----------
 
 def request_digest(

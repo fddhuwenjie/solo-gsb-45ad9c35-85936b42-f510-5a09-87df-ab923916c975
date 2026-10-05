@@ -7,6 +7,12 @@
   并重算**截至窗口末的 calendar=display 剂量**（与剂量接口同口径）、在
   **完整未作废权威时间线**上形成诊断事件（与诊断接口同口径）、以及该规范
   档案的**未结处置单**状态；
+- **盘点定位按当前别名关系核对全部身份**：轮次固化结果按当时的别名关系
+  存储，归并后规范档案在旧轮次中的证据可能以其旧身份（来源 ID）存储。
+  核验时把当前指向该规范档案的全部身份（规范 ID + 全部别名）逐一放到该轮
+  固化结果中解释：出现的身份须全部列入预期清单并明确定位于同一区域；
+  缺失、错位、位置不明、意外出现或区域冲突均阻断凭证，全部身份未出现
+  即轮次未涵盖。旧盘点轮次与已签凭证绝不改写；
 - **固化**：只有所有展品都在盘点中定位到预期区域、窗口内无
   gap / jump / stuck、开放剂量未越限且没有未结处置单时，才把包含各项证据
   摘要的**合规凭证**落库并返回 ``digest``；任一项不满足即返回逐件原因
@@ -38,8 +44,8 @@ from .arbitration import (
 from .calendar import load_calendar, open_intervals
 from .diagnose import DiagnosisEvent, build_events, intersect_window, sort_events
 from .dose import compute_dose
-from .inventory import load_round
-from .merge import resolve_canonical
+from .inventory import identity_evidence, load_round
+from .merge import aliases_of, resolve_canonical
 from .receipts import content_hash_of
 from .schemas import (
     ComplianceCheckOut,
@@ -113,29 +119,82 @@ def _event_dict(e: DiagnosisEvent) -> dict:
     return d
 
 
-def _location_from_round(round_out, canonical_id: str) -> dict:
-    """从盘点轮次固化结果中取一件展品的定位结论。"""
-    for m in round_out.misplaced:
-        if m.canonical_id == canonical_id:
-            return {"status": "misplaced",
-                    "expected_area": m.expected_area, "actual_area": m.actual_area}
-    for m in round_out.missing:
-        if m.canonical_id == canonical_id:
-            return {"status": "missing",
-                    "expected_area": m.expected_area, "actual_area": None}
-    for u in round_out.unknown_position:
-        if u.canonical_id == canonical_id:
-            return {"status": "unknown_position",
-                    "expected_area": u.expected_area, "actual_area": None}
-    for u in round_out.unexpected:
-        if u.canonical_id == canonical_id:
-            return {"status": "unexpected",
-                    "expected_area": None, "actual_area": u.actual_area}
-    for e in round_out.expectations:
-        if e.canonical_id == canonical_id:
-            return {"status": "located",
-                    "expected_area": e.expected_area, "actual_area": e.expected_area}
-    return {"status": "not_covered", "expected_area": None, "actual_area": None}
+def _location_from_round(
+    conn: sqlite3.Connection, round_out, canonical_id: str
+) -> tuple[dict, list[dict]]:
+    """按**当前别名关系**核对该规范档案在轮次固化结果中的全部身份。
+
+    盘点轮次固化时按当时的别名关系解析展品 ID，固化结果随后不改写；归并
+    发生后，该规范档案在旧轮次中的固化证据可能以其旧身份（来源 ID）存储。
+    这里把当前指向该规范档案的全部身份（规范 ID + 全部别名）逐一放到轮次
+    固化结果中解释：**出现的身份须全部列入预期清单并明确定位于同一区域**——
+    缺失、错位、位置不明、意外出现或多个身份定位区域冲突都阻断凭证；
+    全部身份都未在该轮出现则为 ``not_covered``（轮次未涵盖）。
+
+    返回 ``(定位结论, 定位类不合规原因列表)``；定位结论含逐身份明细
+    （``identities``，只列出在该轮出现的身份），并参与凭证摘要哈希。
+    """
+    identities = sorted({canonical_id, *aliases_of(conn, canonical_id)})
+    findings = identity_evidence(round_out, identities)
+    per_identity = [
+        {"identity": ident, **findings[ident]} for ident in sorted(findings)
+    ]
+    multi = len(identities) > 1
+
+    reasons: list[dict] = []
+    if not findings:
+        location = {"status": "not_covered", "expected_area": None,
+                    "actual_area": None, "identities": per_identity}
+        code, template = _LOCATION_REASONS["not_covered"]
+        detail = template
+        if multi:
+            detail = (f"按当前别名关系核对身份 {identities}，"
+                      "盘点轮次中无任何身份的预期与观测记录，无法确认位置")
+        reasons.append({"code": code, "detail": detail})
+        return location, reasons
+
+    # 出现的身份逐一核对：任一缺失/错位/位置不明/意外出现都阻断
+    for ident in sorted(findings):
+        f = findings[ident]
+        if f["status"] == "located":
+            continue
+        code, template = _LOCATION_REASONS[f["status"]]
+        detail = template.format(**f)
+        if multi:
+            detail = f"身份 {ident}：" + detail
+        reasons.append({"code": code, "detail": detail})
+
+    # 明确定位的身份须全部落在同一区域，否则区域冲突阻断
+    located = {ident: f for ident, f in findings.items() if f["status"] == "located"}
+    located_areas = {f["actual_area"] for f in located.values()}
+    if len(located_areas) > 1:
+        mapping = "、".join(
+            f"{ident}→{located[ident]['actual_area']}" for ident in sorted(located)
+        )
+        reasons.append({
+            "code": "inventory_area_conflict",
+            "detail": f"按当前别名关系核对的多个身份在盘点轮次中明确定位于不同区域"
+                      f"（{mapping}），无法确认唯一区域",
+        })
+
+    # 汇总结论：有身份不合格时取按身份排序的首个不合格状态；全部合格但
+    # 区域不一致为 area_conflict；全部定位于同一区域才是 located
+    blocking_first = next(
+        (ident for ident in sorted(findings) if findings[ident]["status"] != "located"),
+        None,
+    )
+    if blocking_first is not None:
+        first = findings[blocking_first]
+        status = first["status"]
+        expected_area, actual_area = first["expected_area"], first["actual_area"]
+    elif len(located_areas) > 1:
+        status, expected_area, actual_area = "area_conflict", None, None
+    else:
+        area = next(iter(located_areas))
+        status, expected_area, actual_area = "located", area, area
+    location = {"status": status, "expected_area": expected_area,
+                "actual_area": actual_area, "identities": per_identity}
+    return location, reasons
 
 
 _LOCATION_REASONS = {
@@ -178,18 +237,17 @@ def check_exhibit(
             detail=f"规范档案 {canonical_id} 已不存在，无法完成合规核验",
         )
 
+    # 1) 盘点定位：按当前别名关系核对该规范档案的全部身份——出现的身份须
+    #    全部列入预期清单并明确定位于同一区域（缺失/错位/位置不明/意外出现/
+    #    区域冲突均阻断；全部身份未出现即轮次未涵盖）
+    location, location_reasons = _location_from_round(conn, round_out, canonical_id)
     check = _ExhibitCheck(
         requested_id=requested_id,
         canonical_id=canonical_id,
-        location=_location_from_round(round_out, canonical_id),
+        location=location,
         dose=None,
     )
-
-    # 1) 盘点定位：唯一定位到预期区域才合规
-    loc = check.location
-    if loc["status"] != "located":
-        code, template = _LOCATION_REASONS[loc["status"]]
-        check.reasons.append({"code": code, "detail": template.format(**loc)})
+    check.reasons.extend(location_reasons)
 
     # 2) 诊断事件：完整未作废权威时间线上形成，再筛选与窗口相交的部分
     rows = conn.execute(

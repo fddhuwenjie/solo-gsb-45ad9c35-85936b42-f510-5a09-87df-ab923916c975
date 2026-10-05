@@ -131,6 +131,8 @@ def test_compliant_credential_solidified_and_queryable(env):
     assert item["compliant"] is True and item["reasons"] == []
     assert item["location"] == {
         "status": "located", "expected_area": "A区", "actual_area": "A区",
+        "identities": [{"identity": eid, "status": "located",
+                        "expected_area": "A区", "actual_area": "A区"}],
     }
     # 证据摘要：calendar=display 剂量（100 lux × 6 h = 600 lux·h）、无事件、无未结单
     dose = item["dose"]
@@ -421,6 +423,165 @@ def test_alias_resolution_after_merge(env):
     replay = check(client, check_body("R1", ["EX-1"]))
     assert replay["already_committed"] is True
     assert replay["exhibits"][0]["requested_id"] == "DUP-1"  # 返回首次固化的原件
+
+
+# ---------- 归并后盘点证据的跨身份核对 ----------
+
+def merge_exhibits(client: TestClient, source_id: str, target_id: str) -> None:
+    """把 source_id 归并进 target_id（来源 ID 成为目标的永久别名）。"""
+    token = client.post("/merges/preview",
+                        json={"source_id": source_id, "target_id": target_id}).json()["token"]
+    r = client.post("/merges/commit", json={"token": token, "resolutions": []})
+    assert r.status_code == 200, r.text
+
+
+def make_compliant_target(client: TestClient, eid: str = "TGT") -> str:
+    """造一个日历 + 平稳读数都合规的目标档案（不参加盘点，盘点证据走旧身份）。"""
+    make_exhibit(client, eid)
+    set_calendar_24h(client, eid)
+    send(client, eid, steady_readings())
+    return eid
+
+
+def test_merged_source_identity_located_in_round(env):
+    """轮次中来源档案定位正常，归并后用目标 ID 或旧别名核验都应合规
+    （修复误报 inventory_not_covered）。"""
+    client, _ = env
+    make_compliant_target(client, "TGT")
+    make_exhibit(client, "SRC")
+    # 归并前 SRC 是独立档案：轮次 R1 中预期并定位于 A 区
+    reconcile(client, "R1", round_body(
+        expected=[{"exhibit_id": "SRC", "area": "A"}],
+        events=[ev("SRC", "A", BASE + 5, -50)],
+    ))
+    # 归并后 R1 的固化证据仍以旧身份 SRC 存储，目标 ID 在轮次中不出现
+    merge_exhibits(client, "SRC", "TGT")
+
+    # 用目标 ID 核验：按当前别名关系找到 SRC 的固化证据，不再误报未涵盖
+    out = check(client, check_body("R1", ["TGT"]))
+    assert out["status"] == "compliant"
+    item, = out["exhibits"]
+    assert item["requested_id"] == "TGT" and item["canonical_id"] == "TGT"
+    assert item["location"] == {
+        "status": "located", "expected_area": "A", "actual_area": "A",
+        "identities": [{"identity": "SRC", "status": "located",
+                        "expected_area": "A", "actual_area": "A"}],
+    }
+
+    # 用旧别名核验（另一个 request_key）：解析到同一规范档案，证据一致
+    out2 = check(client, check_body("R1", ["SRC"], key="chk-alias"))
+    assert out2["status"] == "compliant"
+    item2, = out2["exhibits"]
+    assert item2["requested_id"] == "SRC" and item2["canonical_id"] == "TGT"
+    assert item2["location"] == item["location"]
+
+
+def test_merged_source_missing_in_round_blocks(env):
+    """同轮目标定位正常而来源缺失：归并后核验必须阻断
+    （修复误签合规凭证），且失败不占用 request_key。"""
+    client, _ = env
+    make_compliant_target(client, "TGT")
+    make_exhibit(client, "SRC")
+    # 同一轮：目标 TGT 定位于 A 区，来源 SRC 预期 B 区但全程无事件（缺失）
+    reconcile(client, "R1", round_body(
+        expected=[{"exhibit_id": "TGT", "area": "A"},
+                  {"exhibit_id": "SRC", "area": "B"}],
+        events=[ev("TGT", "A", BASE + 5, -50)],
+    ))
+    merge_exhibits(client, "SRC", "TGT")
+
+    out = check(client, check_body("R1", ["TGT"]))
+    assert out["status"] == "non_compliant"
+    assert out["credential_id"] is None and out["digest"] is None
+    item, = out["exhibits"]
+    assert [r["code"] for r in item["reasons"]] == ["inventory_missing"]
+    assert "SRC" in item["reasons"][0]["detail"]
+    assert item["location"]["status"] == "missing"
+    by_identity = {x["identity"]: x for x in item["location"]["identities"]}
+    assert by_identity["SRC"] == {"identity": "SRC", "status": "missing",
+                                  "expected_area": "B", "actual_area": None}
+    assert by_identity["TGT"] == {"identity": "TGT", "status": "located",
+                                  "expected_area": "A", "actual_area": "A"}
+
+    # 核验失败不占用 request_key：GET 仍为 404
+    assert client.get("/compliance-checks/chk-1").status_code == 404
+    # 同一 request_key 可在新轮次（该规范档案明确定位）下重新核验并固化
+    reconcile(client, "R2", round_body(
+        expected=[{"exhibit_id": "TGT", "area": "A"}],
+        events=[ev("TGT", "A", BASE + 5, -50)],
+    ))
+    fixed = check(client, check_body("R2", ["TGT"]))  # 同一默认 request_key chk-1
+    assert fixed["status"] == "compliant"
+    assert client.get("/compliance-checks/chk-1").status_code == 200
+
+
+def test_same_area_multiple_identities_compliant(env):
+    """同区多身份回归：归并前两身份同轮分别预期并定位于同一区域，
+    归并后核验应合规。"""
+    client, _ = env
+    make_compliant_target(client, "TGT")
+    make_exhibit(client, "SRC")
+    reconcile(client, "R1", round_body(
+        expected=[{"exhibit_id": "TGT", "area": "A"},
+                  {"exhibit_id": "SRC", "area": "A"}],
+        events=[ev("TGT", "A", BASE + 5, -50), ev("SRC", "A", BASE + 5, -50)],
+    ))
+    merge_exhibits(client, "SRC", "TGT")
+
+    out = check(client, check_body("R1", ["TGT"]))
+    assert out["status"] == "compliant"
+    item, = out["exhibits"]
+    assert item["location"] == {
+        "status": "located", "expected_area": "A", "actual_area": "A",
+        "identities": [
+            {"identity": "SRC", "status": "located",
+             "expected_area": "A", "actual_area": "A"},
+            {"identity": "TGT", "status": "located",
+             "expected_area": "A", "actual_area": "A"},
+        ],
+    }
+
+
+def test_area_conflict_between_identities_blocks(env):
+    """同轮多身份明确定位于不同区域：区域冲突阻断凭证。"""
+    client, _ = env
+    make_compliant_target(client, "TGT")
+    make_exhibit(client, "SRC")
+    reconcile(client, "R1", round_body(
+        expected=[{"exhibit_id": "TGT", "area": "A"},
+                  {"exhibit_id": "SRC", "area": "B"}],
+        events=[ev("TGT", "A", BASE + 5, -50), ev("SRC", "B", BASE + 5, -50)],
+    ))
+    merge_exhibits(client, "SRC", "TGT")
+
+    out = check(client, check_body("R1", ["TGT"]))
+    assert out["status"] == "non_compliant"
+    item, = out["exhibits"]
+    assert [r["code"] for r in item["reasons"]] == ["inventory_area_conflict"]
+    assert item["location"]["status"] == "area_conflict"
+    assert item["location"]["expected_area"] is None
+    assert item["location"]["actual_area"] is None
+    # 失败不占用 request_key
+    assert client.get("/compliance-checks/chk-1").status_code == 404
+
+
+def test_unexpected_identity_in_round_blocks(env):
+    """来源身份在轮次中意外出现（不在预期清单但被读到）：阻断凭证。"""
+    client, _ = env
+    make_compliant_target(client, "TGT")
+    make_exhibit(client, "SRC")
+    reconcile(client, "R1", round_body(
+        expected=[{"exhibit_id": "TGT", "area": "A"}],
+        events=[ev("TGT", "A", BASE + 5, -50), ev("SRC", "C", BASE + 5, -50)],
+    ))
+    merge_exhibits(client, "SRC", "TGT")
+
+    out = check(client, check_body("R1", ["TGT"]))
+    assert out["status"] == "non_compliant"
+    item, = out["exhibits"]
+    assert [r["code"] for r in item["reasons"]] == ["inventory_unexpected"]
+    assert "SRC" in item["reasons"][0]["detail"]
+    assert item["location"]["status"] == "unexpected"
 
 
 # ---------- 并发 ----------
