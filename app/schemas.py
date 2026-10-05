@@ -1125,10 +1125,11 @@ class ComplianceLocationOut(BaseModel):
     """一件展品在盘点轮次固化结果中的定位结论。"""
 
     status: Literal["located", "missing", "misplaced", "unknown_position",
-                    "unexpected", "not_covered"] = Field(
+                    "unexpected", "not_covered", "area_conflict"] = Field(
         description="located：定位到预期区域（唯一合规）；missing：缺失；misplaced：错位；"
                     "unknown_position：位置不明；unexpected：不在预期清单但被读到；"
-                    "not_covered：轮次既无预期也无观测记录",
+                    "not_covered：轮次既无预期也无观测记录；"
+                    "area_conflict：归并后多个身份在该轮明确定位到不同区域",
     )
     expected_area: str | None = Field(description="轮次中的预期区域；无预期记录为 null")
     actual_area: str | None = Field(description="轮次判定的实际区域；定位成功（含错位）时给出")
@@ -1139,10 +1140,11 @@ class ComplianceReasonOut(BaseModel):
 
     code: Literal["inventory_missing", "inventory_misplaced",
                   "inventory_unknown_position", "inventory_unexpected",
-                  "inventory_not_covered", "calendar_missing", "dose_exceeded",
+                  "inventory_not_covered", "inventory_area_conflict",
+                  "calendar_missing", "dose_exceeded",
                   "diagnosis_events", "open_tickets"] = Field(
-        description="原因代码：盘点定位 / 未配置日历 / 开放剂量越限 / "
-                    "窗口内 gap-jump-stuck 事件 / 未结处置单",
+        description="原因代码：盘点定位（含归并后多身份区域冲突）/ 未配置日历 / "
+                    "开放剂量越限 / 窗口内 gap-jump-stuck 事件 / 未结处置单",
     )
     detail: str = Field(description="原因说明（含具体区域、事件统计、处置单 ID 等）")
 
@@ -1168,7 +1170,9 @@ class ComplianceExhibitOut(BaseModel):
     canonical_id: str = Field(description="别名解析后的规范档案 ID")
     compliant: bool = Field(description="该件是否通过全部核验项")
     reasons: list[ComplianceReasonOut] = Field(description="不合规原因（合规时为空）")
-    location: ComplianceLocationOut = Field(description="盘点轮次固化结果中的定位结论")
+    location: ComplianceLocationOut = Field(
+        description="盘点轮次固化结果中的定位结论（按当前别名关系核对规范 ID 与全部别名）",
+    )
     dose: ComplianceDoseOut | None = Field(
         description="截至窗口末的 calendar=display 剂量证据；未配置展陈日历为 null",
     )

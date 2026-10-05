@@ -7,6 +7,13 @@
   并重算**截至窗口末的 calendar=display 剂量**（与剂量接口同口径）、在
   **完整未作废权威时间线**上形成诊断事件（与诊断接口同口径）、以及该规范
   档案的**未结处置单**状态；
+- **跨归并盘点证据**：盘点轮次固化时按**当时**的别名关系解析展品 ID，
+  固化结果不改写；归并后同一规范档案可能以多个身份（规范 ID + 全部别名）
+  出现在该轮固化结果中。核验时按**当前别名关系**把指向该规范档案的全部
+  身份放到该轮固化结果中逐一解释：出现的身份都须列入预期清单且明确定位
+  到**同一区域**——任一身份缺失、错位、位置不明或意外出现，或不同身份
+  定位区域冲突，都阻断凭证（不择一放行）；全部身份都未在该轮出现才记
+  ``not_covered``。照度剂量、诊断事件与未结处置单仍按规范档案核算；
 - **固化**：只有所有展品都在盘点中定位到预期区域、窗口内无
   gap / jump / stuck、开放剂量未越限且没有未结处置单时，才把包含各项证据
   摘要的**合规凭证**落库并返回 ``digest``；任一项不满足即返回逐件原因
@@ -39,7 +46,7 @@ from .calendar import load_calendar, open_intervals
 from .diagnose import DiagnosisEvent, build_events, intersect_window, sort_events
 from .dose import compute_dose
 from .inventory import load_round
-from .merge import resolve_canonical
+from .merge import aliases_of, resolve_canonical
 from .receipts import content_hash_of
 from .schemas import (
     ComplianceCheckOut,
@@ -113,31 +120,6 @@ def _event_dict(e: DiagnosisEvent) -> dict:
     return d
 
 
-def _location_from_round(round_out, canonical_id: str) -> dict:
-    """从盘点轮次固化结果中取一件展品的定位结论。"""
-    for m in round_out.misplaced:
-        if m.canonical_id == canonical_id:
-            return {"status": "misplaced",
-                    "expected_area": m.expected_area, "actual_area": m.actual_area}
-    for m in round_out.missing:
-        if m.canonical_id == canonical_id:
-            return {"status": "missing",
-                    "expected_area": m.expected_area, "actual_area": None}
-    for u in round_out.unknown_position:
-        if u.canonical_id == canonical_id:
-            return {"status": "unknown_position",
-                    "expected_area": u.expected_area, "actual_area": None}
-    for u in round_out.unexpected:
-        if u.canonical_id == canonical_id:
-            return {"status": "unexpected",
-                    "expected_area": None, "actual_area": u.actual_area}
-    for e in round_out.expectations:
-        if e.canonical_id == canonical_id:
-            return {"status": "located",
-                    "expected_area": e.expected_area, "actual_area": e.expected_area}
-    return {"status": "not_covered", "expected_area": None, "actual_area": None}
-
-
 _LOCATION_REASONS = {
     "missing": ("inventory_missing",
                 "盘点轮次中定位为缺失：预期区域 {expected_area} 全程无有效读头事件"),
@@ -150,6 +132,89 @@ _LOCATION_REASONS = {
     "not_covered": ("inventory_not_covered",
                     "盘点轮次中无该展品的预期与观测记录，无法确认位置"),
 }
+
+
+def _location_check(
+    conn: sqlite3.Connection, round_out, canonical_id: str
+) -> tuple[dict, list[dict]]:
+    """按**当前别名关系**核对该轮固化的全部身份，返回 (定位结论, 不合规原因)。
+
+    盘点轮次固化时按**当时**的别名关系解析展品 ID，固化结果不改写（见
+    inventory.py）；归并后同一规范档案可能以多个身份（规范 ID + 全部别名）
+    出现在该轮固化结果中。这里把当前指向该规范档案的全部身份放到该轮固化
+    结果中逐一解释：出现的身份都须列入预期清单且明确定位到**同一区域**——
+    任一身份缺失、错位、位置不明或意外出现，或不同身份定位区域冲突，都
+    阻断凭证（跨归并证据须全部合格，不择一放行）；全部身份都未在该轮出现
+    才记 ``not_covered``。普通（未归并）情形身份集合只有规范 ID 一个，
+    核验口径与历史行为完全一致。
+    """
+    identities = sorted({canonical_id, *aliases_of(conn, canonical_id)})
+
+    missing = {m.canonical_id: m for m in round_out.missing}
+    misplaced = {m.canonical_id: m for m in round_out.misplaced}
+    unknown = {u.canonical_id: u for u in round_out.unknown_position}
+    unexpected = {u.canonical_id: u for u in round_out.unexpected}
+    expected = {e.canonical_id: e for e in round_out.expectations}
+
+    # 该轮中出现的每个身份 → (status, expected_area, actual_area)；
+    # 盘点对账的差异分组互斥（见 inventory.py），一个身份至多落入一组
+    findings: dict[str, tuple[str, str | None, str | None]] = {}
+    for ident in identities:
+        if ident in missing:
+            findings[ident] = ("missing", missing[ident].expected_area, None)
+        elif ident in misplaced:
+            m = misplaced[ident]
+            findings[ident] = ("misplaced", m.expected_area, m.actual_area)
+        elif ident in unknown:
+            findings[ident] = ("unknown_position", unknown[ident].expected_area, None)
+        elif ident in unexpected:
+            findings[ident] = ("unexpected", None, unexpected[ident].actual_area)
+        elif ident in expected:
+            area = expected[ident].expected_area
+            findings[ident] = ("located", area, area)
+
+    if not findings:
+        detail = _LOCATION_REASONS["not_covered"][1]
+        if len(identities) > 1:
+            detail = (
+                "盘点轮次中无该展品的预期与观测记录"
+                f"（已按当前别名关系核对身份 {identities}），无法确认位置"
+            )
+        return (
+            {"status": "not_covered", "expected_area": None, "actual_area": None},
+            [{"code": "inventory_not_covered", "detail": detail}],
+        )
+
+    bad = {ident: f for ident, f in findings.items() if f[0] != "located"}
+    if bad:
+        reasons = []
+        for ident in sorted(bad):
+            status, exp, act = bad[ident]
+            code, template = _LOCATION_REASONS[status]
+            detail = template.format(expected_area=exp, actual_area=act)
+            if ident != canonical_id:
+                detail = f"身份 {ident}（归并前档案）：" + detail
+            reasons.append({"code": code, "detail": detail})
+        # 定位结论取按身份排序的首个不合格身份（确定性），逐条原因已列出全部
+        status, exp, act = bad[sorted(bad)[0]]
+        return {"status": status, "expected_area": exp, "actual_area": act}, reasons
+
+    located_areas = {f[1] for f in findings.values()}
+    if len(located_areas) > 1:
+        per_ident = "、".join(
+            f"{ident} 定位于 {f[1]}" for ident, f in sorted(findings.items())
+        )
+        return (
+            {"status": "area_conflict", "expected_area": None, "actual_area": None},
+            [{
+                "code": "inventory_area_conflict",
+                "detail": f"该轮固化结果中同一规范档案的多个身份定位区域冲突"
+                          f"（{per_ident}），全部身份须明确定位于同一区域",
+            }],
+        )
+
+    area = located_areas.pop()
+    return {"status": "located", "expected_area": area, "actual_area": area}, []
 
 
 def check_exhibit(
@@ -178,18 +243,18 @@ def check_exhibit(
             detail=f"规范档案 {canonical_id} 已不存在，无法完成合规核验",
         )
 
+    # 1) 盘点定位：按当前别名关系核对该轮固化的全部身份（规范 ID + 全部
+    #    别名），出现的身份都须列入预期清单且明确定位到同一区域；缺失、
+    #    错位、位置不明、意外出现或区域冲突均阻断凭证
+    location, location_reasons = _location_check(conn, round_out, canonical_id)
+
     check = _ExhibitCheck(
         requested_id=requested_id,
         canonical_id=canonical_id,
-        location=_location_from_round(round_out, canonical_id),
+        location=location,
         dose=None,
     )
-
-    # 1) 盘点定位：唯一定位到预期区域才合规
-    loc = check.location
-    if loc["status"] != "located":
-        code, template = _LOCATION_REASONS[loc["status"]]
-        check.reasons.append({"code": code, "detail": template.format(**loc)})
+    check.reasons.extend(location_reasons)
 
     # 2) 诊断事件：完整未作废权威时间线上形成，再筛选与窗口相交的部分
     rows = conn.execute(

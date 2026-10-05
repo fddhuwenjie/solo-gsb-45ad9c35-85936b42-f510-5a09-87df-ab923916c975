@@ -61,7 +61,9 @@
   记录理由；相同 `request_key` 重放原结果，快照不可变。
 - 支持**展厅开放批次合规核验**：提交 `request_key`、核验时间窗、盘点
   `round_id`、展品 ID 清单与诊断阈值，服务在**一个 SQLite 写事务**内解析
-  别名、读取该轮次固化结果、逐件重算截至窗口末的 `calendar=display` 剂量
+  别名、读取该轮次固化结果（按**当前别名关系**核对该轮固化的全部身份：
+  出现的身份都须列入预期清单且明确定位于同一区域，缺失 / 错位 / 位置不明 /
+  意外出现 / 区域冲突均阻断）、逐件重算截至窗口末的 `calendar=display` 剂量
   与完整诊断事件并检查未结处置单；只有全部展品都定位到预期区域、窗口内无
   gap / jump / stuck、开放剂量未越限且无未结处置单时，才固化包含各项证据
   摘要的**合规凭证**；任一失败返回逐件原因且**不写入**；同一 `request_key`
@@ -1070,6 +1072,13 @@ curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
 - 展品 ID 先经归并别名解析为规范档案（不存在 → 404；解析后同一规范档案
   出现多次 → 422）；
 - 读取 `round_id` 对应轮次的**固化**盘点结果（轮次尚未对账 → 404）；
+- **跨归并盘点证据**：盘点轮次固化时按当时的别名关系解析展品 ID，固化
+  结果不改写；归并后同一规范档案可能以多个身份（规范 ID + 全部别名）
+  出现在该轮固化结果中。核验时按**当前别名关系**把指向该规范档案的全部
+  身份放到该轮固化结果中逐一解释：出现的身份都须列入预期清单且明确定位
+  到**同一区域**——任一身份缺失、错位、位置不明或意外出现，或不同身份
+  定位区域冲突，均阻断凭证（跨归并证据须全部合格，不择一放行）；全部
+  身份都未在该轮出现才记 `not_covered`；
 - 逐件读取展陈日历，按与 `GET /dose?calendar=display` 同口径重算**截至
   窗口末的开放剂量**；
 - 按与 `POST /readings/diagnose` 同口径在完整未作废权威时间线上形成诊断
@@ -1078,8 +1087,9 @@ curl -i -X POST http://localhost:8000/illumination-tickets/7f3a…/close \
 
 ### 合规条件（四项全部满足才固化凭证）
 
-1. 每件展品都在盘点轮次中**定位到预期区域**（缺失 / 错位 / 位置不明 /
-   意外出现 / 轮次未涵盖均为不合规）；
+1. 每件展品都在盘点轮次中**定位到预期区域**：按当前别名关系核对该轮
+   固化的全部身份（规范 ID + 全部别名），任一身份缺失 / 错位 / 位置不明 /
+   意外出现、多个身份定位区域冲突或轮次未涵盖均为不合规；
 2. 窗口内无 `gap` / `jump` / `stuck` 诊断事件（`timestamp_conflict`
    只记入证据，不阻断合规）；
 3. 截至窗口末的 `calendar=display` 开放剂量**未越限**（展品未配置展陈
@@ -1178,10 +1188,66 @@ curl -s -X POST http://localhost:8000/compliance-checks \
 | `inventory_unknown_position` | 位置不明：最后窗口多区域信号差不足阈值 |
 | `inventory_unexpected` | 不在轮次预期清单中但被读到（意外出现） |
 | `inventory_not_covered` | 轮次既无预期也无观测记录，无法确认位置 |
+| `inventory_area_conflict` | 归并后同一规范档案的多个身份在该轮明确定位到不同区域 |
 | `calendar_missing` | 未配置展陈开放日历，无法核算开放剂量 |
 | `dose_exceeded` | 截至窗口末的开放剂量已越限 |
 | `diagnosis_events` | 窗口内存在 gap / jump / stuck 事件（证据 `events` 中给出明细） |
 | `open_tickets` | 存在未结（open）照度异常处置单（`open_ticket_ids` 给出明细） |
+
+> 归并后某条原因来自来源身份的固化证据时，`detail` 会以
+> `身份 <来源ID>（归并前档案）：` 前缀标明；`location.status` 相应多出
+> `area_conflict`（多身份定位区域冲突）取值。
+
+### 27b. 归并后的盘点证据核对（调用示例）
+
+盘点轮次固化在先、档案归并在后时，轮次结果仍以来源身份存储且**不改写**；
+核验按**当前别名关系**把来源身份的固化证据归属到目标档案——用目标 ID
+或旧别名调用等价：
+
+```bash
+# 1) 归并前完成盘点：来源档案 DUP-042 在轮次中定位到 A区展柜
+curl -s -X POST http://localhost:8000/inventory-rounds/ROUND-2026-10-01-01/reconcile \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "start_at": "2026-10-01T08:00:00Z",
+    "window_seconds": 60,
+    "rssi_delta_threshold": 5,
+    "expected": [{"exhibit_id": "DUP-042", "area": "A区展柜"}],
+    "events": [{"exhibit_id": "DUP-042", "area": "A区展柜",
+                "ts": "2026-10-01T08:00:10Z", "rssi": -48}]
+  }'
+
+# 2) 归并 DUP-042 → EX-042（预演 + 提交，见「重复档案归并」）
+curl -s -X POST http://localhost:8000/merges/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"source_id": "DUP-042", "target_id": "EX-042"}'
+curl -s -X POST http://localhost:8000/merges/commit \
+  -H 'Content-Type: application/json' \
+  -d '{"token": "<预演令牌>", "resolutions": []}'
+
+# 3) 用目标 ID（或旧别名 DUP-042）核验：来源身份的固化定位证据归属目标，
+#    不会误报 inventory_not_covered
+curl -s -X POST http://localhost:8000/compliance-checks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "request_key": "hall-open-2026-10-02-am",
+    "round_id": "ROUND-2026-10-01-01",
+    "start": "2026-10-02T01:00:00Z",
+    "end":   "2026-10-02T09:00:00Z",
+    "exhibit_ids": ["EX-042"],
+    "max_rate_lux_per_second": 1.0,
+    "stuck_tolerance_lux": 2.0,
+    "min_stuck_seconds": 1800
+  }'
+# {"status": "compliant", "exhibits": [{"requested_id": "EX-042",
+#   "canonical_id": "EX-042", "location": {"status": "located",
+#   "expected_area": "A区展柜", "actual_area": "A区展柜"}, ...}], ...}
+```
+
+反向情形同样按全部身份核对：若该轮中目标身份定位正常而来源身份**缺失**
+（或错位 / 位置不明 / 意外出现 / 定位区域冲突），归并后核验一律阻断
+（`status=non_compliant`，逐件给出 `inventory_*` 原因），不会只凭目标
+身份的证据签发凭证；失败不写入，`request_key` 不占用。
 
 ### 28. request_key 重放、409 与凭证查询
 
@@ -1192,6 +1258,9 @@ curl -s -X POST http://localhost:8000/compliance-checks \
   摘要）；诊断阈值按浮点稳定序列化参与哈希；
 - 证据摘要：规范化输入 + 轮次 `request_digest` + 逐件证据（盘点定位结论、
   `calendar=display` 剂量、窗口内诊断事件、未结处置单 ID）的 SHA-256。
+  盘点定位结论按**当前别名关系**重算——凭证固化后发生档案归并，使该轮
+  固化证据中归属该规范档案的身份集合变化（如并入了在该轮缺失的旧档案），
+  同键重放会因证据摘要不同而 **409**；已签凭证本身不改写，GET 仍返回原件。
 
 ```bash
 # 相同 request_key + 规范化输入相同 + 证据摘要未变 → 200，重放首次凭证
